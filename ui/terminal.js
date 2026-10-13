@@ -42,6 +42,16 @@ term.onData((data) => {
   if (running) invoke('terminal_write', { data });
   else if (data === '\r') start();
 });
+
+// Ctrl+Enter and Shift+Enter mean "new line, don't send" in the agent CLIs, but
+// xterm sends a plain Enter for both. Send what Alt+Enter sends instead: that is
+// the one sequence Claude Code, opencode and Codex all take as a line break here.
+const NEW_LINE = '\x1b\r';
+term.attachCustomKeyEventHandler((event) => {
+  if (event.key !== 'Enter' || !(event.ctrlKey || event.shiftKey)) return true;
+  if (event.type === 'keydown' && running) invoke('terminal_write', { data: NEW_LINE });
+  return false; // nothing more from xterm for this key press
+});
 term.onResize(({ cols, rows }) => {
   if (running) invoke('terminal_resize', { cols, rows });
 });
