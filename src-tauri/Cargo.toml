@@ -17,8 +17,19 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-single-instance = "2"
+portable-pty = "0.9"
 
 [target.'cfg(windows)'.dependencies]
 # Must match the versions tauri/wry resolve to, since we share their COM objects.
 webview2-com = "0.39"
 windows-core = "0.62"
+
+# The installer is meant to be small: optimise for size and drop debug data.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

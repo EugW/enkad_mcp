@@ -22,7 +22,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{cdp::Cdp, config::Channel};
+use tauri::{AppHandle, Manager};
+
+use crate::{cdp::Cdp, config::Channel, panes::Panes, terminal::Shell};
 
 #[derive(Clone)]
 pub struct Planner {
@@ -30,17 +32,19 @@ pub struct Planner {
     channel: Channel,
     /// Folder holding saved plan states, one JSON file each.
     snapshots: PathBuf,
+    /// Only the dev tools reach into the rest of the app.
+    app: AppHandle,
     router: ToolRouter<Self>,
 }
 
 impl Planner {
-    pub fn new(cdp: Cdp, channel: Channel, snapshots: PathBuf) -> Self {
+    pub fn new(cdp: Cdp, channel: Channel, snapshots: PathBuf, app: AppHandle) -> Self {
         let mut router = Self::tool_router();
         // Raw page access is for adapter development only and never ships.
         if cfg!(debug_assertions) {
             router += Self::dev_tool_router();
         }
-        Self { cdp, channel, snapshots, router }
+        Self { cdp, channel, snapshots, app, router }
     }
 
     /// Run one adapter function in the planner page and hand its result to the client.
@@ -54,9 +58,7 @@ impl Planner {
     async fn adapter_value(&self, name: &str, args: impl Serialize) -> Result<Value, String> {
         // Absent options must stay absent so the adapter's defaults apply.
         let mut args = serde_json::to_value(args).unwrap_or(Value::Null);
-        if let Value::Object(fields) = &mut args {
-            fields.retain(|_, value| !value.is_null());
-        }
+        drop_nulls(&mut args);
         let expression = format!(
             "window.__enkad ? window.__enkad.call({}, {args}) : Promise.reject(new Error('the adapter is not loaded in the planner page'))",
             json!(name)
@@ -127,6 +129,18 @@ impl Planner {
             Ok(plan) => ok(json!({ "plan": plan, "previousStateSavedAs": saved["id"] })),
             Err(e) => fail(e),
         }
+    }
+}
+
+/// Remove null fields at every depth, so an option left out is `undefined` in the page.
+fn drop_nulls(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            fields.retain(|_, field| !field.is_null());
+            fields.values_mut().for_each(drop_nulls);
+        }
+        Value::Array(items) => items.iter_mut().for_each(drop_nulls),
+        _ => {}
     }
 }
 
@@ -255,6 +269,46 @@ enum EditOp {
         /// Recipe id, or the name of an item the recipe makes. Omit to clear.
         recipe: Option<String>,
     },
+    /// Change the settings of a building. Only the fields given are changed.
+    Configure {
+        uid: u32,
+        /// Item name or id the building hands out: for depot unloaders, pumps, conduit outlets and control ports.
+        item: Option<String>,
+        /// Which output port `item` applies to, for buildings with several. Defaults to the first.
+        port: Option<u32>,
+        /// Control ports only: the most items per minute let through, in steps of 0.5. 0 removes the limit.
+        rate: Option<f64>,
+        /// Control ports only: the count setting shown next to the rate in the planner.
+        count: Option<u32>,
+        /// Conduit outlets only.
+        infinite: Option<bool>,
+        disabled: Option<bool>,
+        /// Mode label as the planner shows it, for buildings that have modes.
+        mode: Option<String>,
+    },
+    /// Change what the plan's depot can supply. Unloaders and outlets deliver nothing from an empty depot.
+    SetDepot {
+        /// True makes every item available without limit.
+        unlimited: Option<bool>,
+        /// Starting stock and income for individual items.
+        stock: Option<Vec<DepotStock>>,
+    },
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct DepotStock {
+    /// Item name or id.
+    item: String,
+    /// Units in the depot at the start of the simulation.
+    count: Option<u32>,
+    /// Units arriving per minute, in steps of 0.5.
+    rate: Option<f64>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+struct PortsArgs {
+    /// Building uids to report.
+    uids: Vec<u32>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -294,6 +348,18 @@ struct EvalArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct TypeArgs {
+    /// Text to type. Use "\r" for Enter.
+    text: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct DragArgs {
+    /// Horizontal distance in CSS pixels.
+    dx: f64,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct ClickArgs {
     /// Horizontal CSS pixel position in the planner view.
     x: f64,
@@ -315,7 +381,8 @@ const STATUS_SCRIPT: &str = r#"(async () => {
 #[tool_router]
 impl Planner {
     #[tool(
-        description = "Report the planner channel, whether the adapter can reach the planner's internals, and a summary of the open plan (size, entity counts, simulation state). Call this first: the other tools only work when `adapter.ok` is true."
+        description = "Report the planner channel, whether the adapter can reach the planner's internals, and a summary of the open plan (size, entity counts, simulation state). Call this first: the other tools only work when `adapter.ok` is true.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self) -> CallToolResult {
         match self.cdp.eval(STATUS_SCRIPT).await {
@@ -329,42 +396,56 @@ impl Planner {
     }
 
     #[tool(
-        description = "List what is placed in the open plan: buildings (uid, name, position, size, rotation, active recipe) and belts and pipes (uid, kind, length, route as corner cells from source to sink). Positions are planner cells: x grows right, y grows down, and an entity's position is the top-left cell of its footprint."
+        description = "List what is placed in the open plan: buildings (uid, name, position, size, rotation, active recipe) and belts and pipes (uid, kind, length, route as corner cells from source to sink). Positions are planner cells: x grows right, y grows down, and an entity's position is the top-left cell of its footprint.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_layout(&self, Parameters(args): Parameters<LayoutArgs>) -> CallToolResult {
         self.adapter("layout", args).await
     }
 
     #[tool(
-        description = "List the connections of the open plan: which building output port feeds which building input port, through which belts or pipes (`via` uids, empty when the two buildings touch), and the items per minute flowing there."
+        description = "List where the ports of the given buildings sit: the building cell each port is on, the cell just outside it, which way it faces, and whether it carries belt items or pipe fluids. Use it to write routes for `apply_edits`: a path leaving an output starts \"cell>outsideCell>...\", and a path entering an input ends \"...>outsideCell>cell\".",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn get_ports(&self, Parameters(args): Parameters<PortsArgs>) -> CallToolResult {
+        self.adapter("ports", args).await
+    }
+
+    #[tool(
+        description = "List the connections of the open plan: which building output port feeds which building input port, through which belts or pipes (`via` uids, empty when the two buildings touch), and the items per minute flowing there.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_graph(&self, Parameters(args): Parameters<GraphArgs>) -> CallToolResult {
         self.adapter("graph", args).await
     }
 
     #[tool(
-        description = "Report simulated throughput at the current tick, in items per minute: what each building takes in and puts out, which buildings are stalled (idle or clogged), ports the simulation has marked (for example a low-priority input that is being starved), and what the depot gains and loses overall. A `~` after a rate means it has not settled."
+        description = "Report simulated throughput at the current tick, in items per minute: what each building takes in and puts out, which buildings are stalled (idle or clogged), ports the simulation has marked (for example a low-priority input that is being starved), and what the depot gains and loses overall. A `~` after a rate means it has not settled.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_flows(&self, Parameters(args): Parameters<FlowsArgs>) -> CallToolResult {
         self.adapter("flows", args).await
     }
 
     #[tool(
-        description = "Report how many items moved into and out of the given buildings over the simulated run, summed per time window. Use it to check start-up behaviour and whether a rate is sustained rather than reached once. The simulation runs at 240 ticks per minute."
+        description = "Report how many items moved into and out of the given buildings over the simulated run, summed per time window. Use it to check start-up behaviour and whether a rate is sustained rather than reached once. The simulation runs at 240 ticks per minute.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_history(&self, Parameters(args): Parameters<HistoryArgs>) -> CallToolResult {
         self.adapter("history", args).await
     }
 
     #[tool(
-        description = "List the building and path types that can be placed (id, name, layer, size, port counts), or with `type` the recipes of one building type."
+        description = "List the building and path types that can be placed (id, name, layer, size, port counts), or with `type` the recipes of one building type.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_catalog(&self, Parameters(args): Parameters<CatalogArgs>) -> CallToolResult {
         self.adapter("catalog", args).await
     }
 
     #[tool(
-        description = "Change the open plan: add buildings, belts and pipes, delete, move, rotate, set recipes. The edits are applied in order as one batch: if any of them fails (for example the target cells are occupied) none is applied. The batch is one undo step in the planner, and the previous state of the plan is saved as a snapshot first. The planner applies its own placement rules. Afterwards check the result with `get_graph` and `get_flows`: the simulation needs a moment to re-solve, shown as `solving`. Fails on a read-only plan."
+        description = "Change the open plan: add buildings, belts and pipes, delete, move, rotate, set recipes, change building settings (item, rate limit, count) and the depot. The edits are applied in order as one batch: if any of them fails (for example the target cells are occupied) none is applied. Where a new belt or pipe crosses an existing one the planner splits both and adds a bridge, which the result reports. The batch is one undo step in the planner, and the previous state of the plan is saved as a snapshot first. The planner applies its own placement rules. Afterwards check the result with `get_graph` and `get_flows`: the simulation needs a moment to re-solve, shown as `solving`. Fails on a read-only plan.",
+        annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false)
     )]
     async fn apply_edits(&self, Parameters(args): Parameters<EditArgs>) -> CallToolResult {
         let saved = match self.save_snapshot("before apply_edits", true).await {
@@ -381,21 +462,24 @@ impl Planner {
     }
 
     #[tool(
-        description = "Return the open plan as a blueprint string, the format the planner's own paste and import accept."
+        description = "Return the open plan as a blueprint string, the format the planner's own paste and import accept.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn export_blueprint(&self) -> CallToolResult {
         self.adapter("exportBlueprint", json!({})).await
     }
 
     #[tool(
-        description = "Replace the contents of the open plan with a blueprint string. The current state is saved as a snapshot first, and the change is one undo step in the planner. The plan keeps its own area size. Entities may get new uids, so read the layout again afterwards. Fails on a read-only plan."
+        description = "Replace the contents of the open plan with a blueprint string. The current state is saved as a snapshot first, and the change is one undo step in the planner. The plan keeps its own area size. Entities may get new uids, so read the layout again afterwards. Fails on a read-only plan.",
+        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
     )]
     async fn import_blueprint(&self, Parameters(args): Parameters<ImportArgs>) -> CallToolResult {
         self.replace_plan(&args.blueprint, "before import_blueprint").await
     }
 
     #[tool(
-        description = "Save the current state of the open plan to disk so it can be restored later. Take one before a series of changes."
+        description = "Save the current state of the open plan to disk so it can be restored later. Take one before a series of changes.",
+        annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false)
     )]
     async fn snapshot_create(
         &self,
@@ -407,7 +491,7 @@ impl Planner {
         }
     }
 
-    #[tool(description = "List saved snapshots, newest first.")]
+    #[tool(description = "List saved snapshots, newest first.", annotations(read_only_hint = true, open_world_hint = false))]
     async fn snapshot_list(&self) -> CallToolResult {
         let mut rows: Vec<Value> = fs::read_dir(&self.snapshots)
             .into_iter()
@@ -436,7 +520,8 @@ impl Planner {
     }
 
     #[tool(
-        description = "Put the open plan back to a saved snapshot. The state being replaced is itself saved first, and the change is one undo step in the planner. Entities may get new uids, so read the layout again afterwards. Fails on a read-only plan."
+        description = "Put the open plan back to a saved snapshot. The state being replaced is itself saved first, and the change is one undo step in the planner. Entities may get new uids, so read the layout again afterwards. Fails on a read-only plan.",
+        annotations(read_only_hint = false, destructive_hint = true, open_world_hint = false)
     )]
     async fn snapshot_restore(
         &self,
@@ -457,7 +542,7 @@ impl Planner {
             .await
     }
 
-    #[tool(description = "Capture the planner view as a JPEG image.")]
+    #[tool(description = "Capture the planner view as a JPEG image.", annotations(read_only_hint = true, open_world_hint = false))]
     async fn screenshot(&self, Parameters(args): Parameters<ScreenshotArgs>) -> CallToolResult {
         let scale = args.scale.unwrap_or(0.5).clamp(0.1, 1.0);
         match self.cdp.screenshot(scale).await {
@@ -490,6 +575,41 @@ impl Planner {
         };
         match self.cdp.eval(&format!("{source}\n;window.__enkad.api.health()")).await {
             Ok(value) => ok(value),
+            Err(e) => fail(e),
+        }
+    }
+
+    #[tool(
+        description = "Dev builds only. Show the terminal pane and type text into its shell, as the user would."
+    )]
+    async fn terminal_type(&self, Parameters(args): Parameters<TypeArgs>) -> CallToolResult {
+        self.app.state::<Arc<Panes>>().set_visible(true);
+        self.app.state::<Shell>().type_text(&args.text);
+        ok(json!({ "typed": args.text.len() }))
+    }
+
+    #[tool(
+        description = "Dev builds only. Evaluate a JavaScript expression in the terminal pane's page; `window.__term` is its xterm instance."
+    )]
+    async fn terminal_eval(&self, Parameters(args): Parameters<EvalArgs>) -> CallToolResult {
+        let Some(webview) = self.app.get_webview("terminal") else {
+            return fail("the terminal pane does not exist");
+        };
+        match Cdp::new(webview).eval(&args.expression).await {
+            Ok(value) => ok(value),
+            Err(e) => fail(e),
+        }
+    }
+
+    #[tool(
+        description = "Dev builds only. Drag the terminal pane's left edge by a number of CSS pixels with real mouse input; negative widens the pane."
+    )]
+    async fn terminal_drag_edge(&self, Parameters(args): Parameters<DragArgs>) -> CallToolResult {
+        let Some(webview) = self.app.get_webview("terminal") else {
+            return fail("the terminal pane does not exist");
+        };
+        match Cdp::new(webview).drag(2.0, 200.0, 2.0 + args.dx).await {
+            Ok(()) => ok(json!({ "dragged": args.dx })),
             Err(e) => fail(e),
         }
     }

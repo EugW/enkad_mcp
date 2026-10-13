@@ -281,6 +281,79 @@
     throw new Error(`"${wanted}" matches several ${type.name} recipes; use a recipe id: ${hits.map((r) => `${r.numericId} (${partsText(r.ingredients)})`).join(', ')}`);
   }
 
+  // ---- building settings ---------------------------------------------------
+
+  // A control port stores its rate limit in half items per minute.
+  const RATE_UNITS_PER_MINUTE = 2;
+  const isControlPort = (e) => e.ports.some((p) => p.canLimit);
+
+  /** Output ports whose item the user picks: unloaders, pumps, outlets, control ports. */
+  const itemPorts = (e) => e.ports.filter((p) => p.output && (p.settableOutput || p.depotAccess));
+
+  function itemPort(e, index) {
+    const ports = itemPorts(e);
+    return index == null ? ports[0] : ports.find((p) => p.index === index);
+  }
+
+  function findItem(port, wanted) {
+    const text = String(wanted).trim().toLowerCase();
+    const items = port.items || [];
+    const hit = items.find((i) => String(i.numericId) === text || i.name.toLowerCase() === text);
+    if (hit) return hit;
+    const close = items.filter((i) => i.name.toLowerCase().includes(text)).slice(0, 8).map((i) => i.name);
+    throw new Error(`this port cannot output "${wanted}"${close.length ? `; did you mean ${close.join(', ')}?` : ''}`);
+  }
+
+  /** "item=Clean Water rate=6/m count=5 infinite", or "" when everything is at its default. */
+  function settingsText(e) {
+    const parts = [];
+    const ports = itemPorts(e);
+    for (const p of ports) {
+      if (p.state.outputItem) parts.push(`${ports.length > 1 ? `item[${p.index}]` : 'item'}=${p.state.outputItem.name}`);
+    }
+    if (isControlPort(e)) {
+      if (e.state.value) parts.push(`rate=${e.state.value / RATE_UNITS_PER_MINUTE}/m`);
+      if (e.state.counter) parts.push(`count=${e.state.counter}`);
+    }
+    if (e.state.infinite) parts.push('infinite');
+    if (e.state.disabled) parts.push('disabled');
+    const mode = (e.modes || []).find((m) => m.value === e.state.mode);
+    if (mode && e.state.mode) parts.push(`mode=${mode.label}`);
+    return parts.join(' ');
+  }
+
+  const FACING = { '0,-1': 'N', '1,0': 'E', '0,1': 'S', '-1,0': 'W' };
+
+  /** Every item in the game, read off the item class that recipes refer to. */
+  function allItems(a) {
+    for (const type of catalog(a)) {
+      const part = (type.sample.recipes || []).flatMap((r) => r.ingredients).find((p) => p && p.item);
+      const storage = part && part.item.constructor.storage;
+      if (storage) return Object.values(storage);
+    }
+    throw new Error('could not read the item list: this planner build needs an adapter update');
+  }
+
+  function findAnyItem(a, wanted) {
+    const text = String(wanted).trim().toLowerCase();
+    const items = allItems(a);
+    const hit = items.find((i) => String(i.numericId) === text || i.name.toLowerCase() === text);
+    if (hit) return hit;
+    const close = items.filter((i) => i.name.toLowerCase().includes(text)).slice(0, 8).map((i) => i.name);
+    throw new Error(`unknown item "${wanted}"${close.length ? `; did you mean ${close.join(', ')}?` : ''}`);
+  }
+
+  /** What the plan's depot can hand out. Unloaders and outlets draw from it. */
+  function depotSummary(a) {
+    const depot = a.depot;
+    const names = new Map(depot.items.size ? allItems(a).map((i) => [i.numericId, i.name]) : []);
+    const stock = [...depot.items].map(([id, entry]) => {
+      const rate = entry.rate ? ` +${entry.rate / RATE_UNITS_PER_MINUTE}/m` : '';
+      return `${names.get(id) || '#' + id} ${entry.count || 0}${rate}`;
+    });
+    return { unlimited: !!depot.unlimited, stock: stock.join(', ') };
+  }
+
   // ---- editing -------------------------------------------------------------
 
   // Edits go through the planner's own operations (the ones behind its mouse and
@@ -297,16 +370,40 @@
     for (const uid of uids) a.selectionEntities.add(entity(a, uid));
   }
 
-  const describe = (e) => {
-    const box = footprint({ e, x: e.placement.x, y: e.placement.y });
+  const describeAt = (p) => {
+    const { e } = p;
+    const box = footprint(p);
     return isBuilding(e)
       ? { uid: e.uid, name: e.name, x: box.x, y: box.y, w: box.w, h: box.h, rotation: e.rotation }
-      : { uid: e.uid, kind: kindOf(e), cells: e.cells.length, route: routeOf({ e, x: e.placement.x, y: e.placement.y }) };
+      : { uid: e.uid, kind: kindOf(e), cells: e.cells.length, route: routeOf(p) };
   };
+  const describe = (e) => describeAt({ e, x: e.placement.x, y: e.placement.y });
+
+  /** The plan's buildable rectangle; the grid has a margin around it. */
+  function buildable(a) {
+    const s = a.rootLayer.safeArea;
+    return s ? { x: s.x, y: s.y, w: s.w, h: s.h } : null;
+  }
+
+  /** Which cells stopped the placement in progress, and what is on them. */
+  function blockedCells(a) {
+    const cells = [...(a.collisions || new Map()).values()].map((c) => [c.x, c.y]);
+    if (!cells.length || cells.some(([x, y]) => !Number.isInteger(x) || !Number.isInteger(y))) return '';
+    const everything = placed(a);
+    const occupant = ([x, y]) => {
+      const hit = everything.find((p) => (isBuilding(p.e)
+        ? inRegion(footprint(p), { x, y, w: 1, h: 1 })
+        : p.e.cells.some((c) => p.x + c.pos.x === x && p.y + c.pos.y === y)));
+      return hit ? `${hit.e.name} uid ${hit.e.uid}` : 'outside the plan area';
+    };
+    const shown = cells.slice(0, 6).map((cell) => `${cell.join(',')} (${occupant(cell)})`);
+    return `blocked at ${shown.join('; ')}${cells.length > shown.length ? ` and ${cells.length - shown.length} more cells` : ''}`;
+  }
 
   /** Place serialised entities at the cells they name, exactly as a paste would. */
   function place(a, kindLayerTag, serialised) {
     const layerTag = (kindLayerTag & a.pipeLayer.tags) ? a.pipeLayer.tags : a.rootLayer.tags;
+    const uidsBefore = new Set(placed(a).map((p) => p.e.uid));
     const existing = new Set(a.layers.list);
     a.armSerialized({ version: FORMAT_VERSION, layers: [{ layerTag, entities: [serialised] }] });
     const moving = a.layers.list.filter((layer) => !existing.has(layer));
@@ -315,12 +412,26 @@
     for (const layer of moving) { layer.region.x = 0; layer.region.y = 0; }
     a.testIntersections();
     if (!a.confirmPlacement(false)) {
+      const blocked = blockedCells(a);
       a.cancelAllLayers();
-      throw new Error('cannot place it there: the cells are occupied or outside the plan');
+      throw new Error(`cannot place it there: ${blocked || 'the cells are occupied or outside the plan'}`);
     }
-    const placedEntities = a.selectionEntities.allEntries.map(([e]) => e);
     a.selectionEntities.clear();
-    return placedEntities.map(describe);
+    // Compare by uid rather than trusting the selection: where a new path crosses
+    // an old one the planner splits both and puts a bridge at the crossing.
+    const now = placed(a);
+    const result = { added: now.filter((p) => !uidsBefore.has(p.e.uid)).map(describeAt) };
+    const uidsNow = new Set(now.map((p) => p.e.uid));
+    const replaced = [...uidsBefore].filter((uid) => !uidsNow.has(uid));
+    if (replaced.length) {
+      result.replaced = replaced;
+      result.note = 'the planner split the crossing paths and added a bridge; the replaced uids no longer exist';
+    }
+    const area = buildable(a);
+    const outside = area && result.added.some((d) => d.name && !(d.x >= area.x && d.y >= area.y
+      && d.x + d.w <= area.x + area.w && d.y + d.h <= area.y + area.h));
+    if (outside) result.warning = `outside the buildable area (x ${area.x}..${area.x + area.w - 1}, y ${area.y}..${area.y + area.h - 1})`;
+    return result;
   }
 
   function parseRoute(route) {
@@ -401,6 +512,48 @@
       return op.uids.map((uid) => describe(entity(a, uid)));
     },
 
+    configure(a, op) {
+      const e = entity(a, op.uid);
+      if (!isBuilding(e)) throw new Error(`uid ${op.uid} is not a building`);
+      if (op.item !== undefined) {
+        const port = itemPort(e, op.port);
+        if (!port) throw new Error(`${e.name} has no output whose item can be chosen`);
+        port.state.outputItem = op.item === null ? null : findItem(port, op.item);
+      }
+      if (op.rate !== undefined || op.count !== undefined) {
+        if (!isControlPort(e)) throw new Error(`${e.name} has no rate limit or count: only control ports do`);
+        if (op.rate !== undefined) e.state.value = Math.round((op.rate || 0) * RATE_UNITS_PER_MINUTE);
+        if (op.count !== undefined) e.state.counter = Math.round(op.count || 0);
+      }
+      if (op.infinite !== undefined) {
+        if (!e.infinitable) throw new Error(`${e.name} cannot be set to infinite`);
+        e.state.infinite = !!op.infinite;
+      }
+      if (op.disabled !== undefined) {
+        if (!e.disableable) throw new Error(`${e.name} cannot be disabled`);
+        e.state.disabled = !!op.disabled;
+      }
+      if (op.mode !== undefined) {
+        const modes = e.modes || [];
+        const text = String(op.mode).trim().toLowerCase();
+        const mode = modes.find((m) => String(m.label).toLowerCase() === text);
+        if (!mode) throw new Error(`${e.name} has no mode "${op.mode}"${modes.length ? `; it has ${modes.map((m) => m.label).join(', ')}` : ''}`);
+        e.state.mode = mode.value;
+      }
+      return { uid: e.uid, name: e.name, settings: settingsText(e) };
+    },
+
+    set_depot(a, op) {
+      const depot = a.depot;
+      if (op.unlimited !== undefined) depot.unlimited = !!op.unlimited;
+      for (const entry of op.stock || []) {
+        const item = findAnyItem(a, entry.item);
+        if (entry.count !== undefined) depot.update(item, 'count', entry.count);
+        if (entry.rate !== undefined) depot.update(item, 'rate', entry.rate);
+      }
+      return depotSummary(a);
+    },
+
     set_recipe(a, op) {
       const e = entity(a, op.uid);
       if (!isBuilding(e)) throw new Error(`uid ${op.uid} is not a building`);
@@ -476,18 +629,7 @@
     .map((r) => `${r.item ? r.item.name : '#' + r.itemId} ${round(r.rate * scale)}${mark(r)}`)
     .join(', ');
 
-  function itemNames(a) {
-    const names = new Map();
-    for (const { e } of placed(a)) {
-      if (!isBuilding(e)) continue;
-      for (const recipe of e.recipes || []) {
-        for (const part of [...(recipe.ingredients || []), ...(recipe.outcomes || [])]) {
-          if (part && part.item) names.set(part.item.numericId, part.item.name);
-        }
-      }
-    }
-    return names;
-  }
+  const itemNames = (a) => new Map(allItems(a).map((i) => [i.numericId, i.name]));
 
   const recipeText = (recipes) => recipes
     .filter(Boolean)
@@ -516,11 +658,13 @@
         plan: {
           name: planName(),
           width: a.safeW, height: a.safeH,
+          buildable: buildable(a),
           contentBounds: { x: bounds.x, y: bounds.y, w: bounds.w, h: bounds.h },
           counts: counts(a),
           readOnly: !!a.readOnly(),
           undoDepth: a.undoStack.past.length,
         },
+        depot: depotSummary(a),
       };
       try {
         const s = await sim();
@@ -544,15 +688,42 @@
         if (!inRegion(box, region)) continue;
         if (isBuilding(p.e)) {
           const recipe = s ? recipeText(s.getBuildingRecipes(p.e) || []) : '';
-          buildings.push([p.e.uid, p.e.name, box.x, box.y, box.w, box.h, p.e.rotation, recipe]);
+          buildings.push([p.e.uid, p.e.name, box.x, box.y, box.w, box.h, p.e.rotation, recipe, settingsText(p.e)]);
         } else {
           paths.push([p.e.uid, kindOf(p.e), p.e.cells.length, routeOf(p)]);
         }
       }
       return {
-        buildings: { columns: ['uid', 'name', 'x', 'y', 'w', 'h', 'rotation', 'recipe'], rows: buildings },
+        buildings: { columns: ['uid', 'name', 'x', 'y', 'w', 'h', 'rotation', 'recipe', 'settings'], rows: buildings },
         paths: { columns: ['uid', 'kind', 'cells', 'route'], rows: paths },
         note: 'a route runs from the cell it takes items from, through its own corner cells, to the cell it delivers into',
+      };
+    },
+
+    /** Where each port of the given buildings sits, and which cell a path must use to reach it. */
+    ports({ uids }) {
+      const a = area();
+      const rows = [];
+      for (const uid of uids) {
+        const e = entity(a, uid);
+        if (!isBuilding(e)) throw new Error(`uid ${uid} is not a building`);
+        const box = footprint({ e, x: e.placement.x, y: e.placement.y });
+        for (const p of e.ports) {
+          if (p.virtual) continue;
+          // A port's direction is the way items travel through it.
+          const cell = [box.x + p.position.x, box.y + p.position.y];
+          const sign = p.output ? 1 : -1;
+          const outside = [cell[0] + sign * p.direction.x, cell[1] + sign * p.direction.y];
+          rows.push([
+            e.uid, e.name, p.output ? 'out' : 'in', p.index, p.fluid ? 'pipe' : 'belt',
+            cell.join(','), outside.join(','), FACING[`${sign * p.direction.x},${sign * p.direction.y}`] || '?',
+          ]);
+        }
+      }
+      return {
+        columns: ['uid', 'name', 'side', 'port', 'carries', 'cell', 'outsideCell', 'faces'],
+        rows,
+        note: 'a route leaving an output starts "cell>outsideCell>..."; a route entering an input ends "...>outsideCell>cell"',
       };
     },
 
@@ -605,7 +776,9 @@
         if (only && !only.has(owner.uid)) continue;
         marks.push([owner.uid, owner.name, port.output ? 'out' : 'in', port.index, m.kind, m.wins]);
       }
-      const depot = (which) => rateList(s.netDepotTotals(which), TICKS_PER_MINUTE);
+      // The simulation books power through the depot too; the planner's own panel leaves it out.
+      const isPower = (item) => item && item.data && (item.data.id === 'power' || item.data.type === 'power');
+      const depot = (which) => rateList(s.netDepotTotals(which).filter((r) => !isPower(r.item)), TICKS_PER_MINUTE);
       return {
         tick: s.targetTick, ticks: s.tickCount,
         solving: s.solveProgress != null || !!s.solvePending,

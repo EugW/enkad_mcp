@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "terminal-pane",
+  "description": "Lets the local terminal pane drive its shell and resize itself. The planner webview is remote content and is granted nothing.",
+  "webviews": ["terminal"],
+  "permissions": [
+    "allow-terminal-start",
+    "allow-terminal-write",
+    "allow-terminal-resize",
+    "allow-terminal-drag"
+  ]
+}

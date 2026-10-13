@@ -78,6 +78,21 @@ impl Cdp {
         Ok(())
     }
 
+    /// Press at (x, y), move horizontally to `to_x` and release, as real mouse input.
+    pub async fn drag(&self, x: f64, y: f64, to_x: f64) -> Result<(), String> {
+        let event = |kind: &str, x: f64, buttons: u8| {
+            json!({ "type": kind, "x": x, "y": y, "button": "left", "buttons": buttons, "clickCount": 1 })
+        };
+        self.call("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }))
+            .await?;
+        self.call("Input.dispatchMouseEvent", event("mousePressed", x, 1)).await?;
+        self.call("Input.dispatchMouseEvent", event("mouseMoved", to_x, 1)).await?;
+        // Give the page a frame to act on the move before the button comes up.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.call("Input.dispatchMouseEvent", event("mouseReleased", to_x, 0)).await?;
+        Ok(())
+    }
+
     /// Capture the viewport as a base64 JPEG, optionally scaled down.
     pub async fn screenshot(&self, scale: f64) -> Result<String, String> {
         let viewport = self
