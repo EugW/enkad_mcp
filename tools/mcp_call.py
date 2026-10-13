@@ -15,7 +15,9 @@ import sys
 import urllib.error
 import urllib.request
 
-CONFIG = os.path.join(os.environ["LOCALAPPDATA"], "dev.enkad-mcp.planner", "config.json")
+# The same variable that points the app at another data folder points this at it too.
+DATA_DIR = os.environ.get("ENKAD_MCP_DATA_DIR") or os.path.join(os.environ["LOCALAPPDATA"], "dev.enkad-mcp.planner")
+CONFIG = os.path.join(DATA_DIR, "config.json")
 
 
 class Client:

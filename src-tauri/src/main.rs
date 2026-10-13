@@ -50,14 +50,18 @@ fn open_folder(path: &Path) {
 }
 
 fn main() {
-    tauri::Builder::default()
-        // A second launch would find the MCP port taken; bring the first window forward instead.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    let mut builder = tauri::Builder::default();
+    // A second launch would find the MCP port taken; bring the first window forward
+    // instead. A copy pointed at its own data folder is a separate instance on purpose.
+    if std::env::var_os(config::DATA_DIR_OVERRIDE).is_none() {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_window("main") {
                 let _ = window.unminimize();
                 let _ = window.set_focus();
             }
-        }))
+        }));
+    }
+    builder
         .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             terminal::terminal_start,

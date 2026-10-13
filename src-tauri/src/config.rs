@@ -125,8 +125,15 @@ impl Config {
     }
 }
 
+/// Set to run a second copy against its own folder (profile, port, token), so
+/// tests never touch the plans in the real one.
+pub const DATA_DIR_OVERRIDE: &str = "ENKAD_MCP_DATA_DIR";
+
 pub fn load(app: &AppHandle) -> Result<Config, Box<dyn Error>> {
-    let data_dir = app.path().app_local_data_dir()?;
+    let data_dir = match std::env::var_os(DATA_DIR_OVERRIDE) {
+        Some(dir) => PathBuf::from(dir),
+        None => app.path().app_local_data_dir()?,
+    };
     fs::create_dir_all(&data_dir)?;
     let path = data_dir.join(CONFIG_FILE);
 

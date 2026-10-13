@@ -5,11 +5,7 @@
 // Coordinates are the planner's own placement cells: x grows right, y grows down,
 // and an entity's position is the top-left cell of its footprint.
 (() => {
-  const VERSION = 2;
-  if (window.__enkad && window.__enkad.dispose) window.__enkad.dispose(); // dev hot reload
-
-  // The simulation class is found by scanning loaded modules; keep them all listed.
-  try { performance.setResourceTimingBufferSize(2000); } catch (e) { /* older engines */ }
+  const VERSION = 3;
 
   const TICKS_PER_MINUTE = 240;
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -17,13 +13,25 @@
 
   // ---- planner handles -----------------------------------------------------
 
-  // Debug handles the planner itself exposes on beta builds.
-  const REQUIRED_GLOBALS = ['__area', '__glarea'];
+  // The planner's own harness, window.__h, hands out the open plan and its
+  // simulation. The planner installs it a moment after the page has mounted.
+  function harness() {
+    const h = window.__h;
+    if (!h) throw new Error('the planner has not finished loading, or this build has no window.__h');
+    return h;
+  }
 
   function area() {
-    const a = typeof window.__area === 'function' ? window.__area() : null;
+    const a = harness().area;
     if (!a) throw new Error('no plan is open in the planner');
     return a;
+  }
+
+  /** The simulation of the open plan. */
+  function sim() {
+    const production = harness().production;
+    if (!production) throw new Error('no plan is open in the planner');
+    return production;
   }
 
   /** Every placed entity as {e, x, y}, ground layer first, then the pipe layer. */
@@ -96,114 +104,6 @@
     }
     points.push([x + last.pos.x + last.direction.x, y + last.pos.y + last.direction.y]);
     return points.map((p) => p.join(',')).join('>');
-  }
-
-  // ---- simulation ----------------------------------------------------------
-
-  // The planner keeps one simulation object per open plan and exposes none of
-  // them. Find the class by its method names (those survive minification), then
-  // note each instance as the planner's own UI uses it.
-  const SIM_METHODS = ['pathRates', 'buildingItemRates', 'buildingTransfers', 'netDepotTotals'];
-  let simClass = null;
-  let unhook = null;
-  let sims = []; // WeakRef, so closed plans can be collected
-
-  async function locateSimClass() {
-    const urls = new Set();
-    const chunk = /\/_app\/immutable\/(chunks|nodes|entry)\/[^?]+\.js$/;
-    for (const entry of performance.getEntriesByType('resource')) if (chunk.test(entry.name)) urls.add(entry.name);
-    for (const link of document.querySelectorAll('link[rel=modulepreload]')) if (chunk.test(link.href)) urls.add(link.href);
-    for (const url of urls) {
-      let module;
-      try { module = await import(url); } catch (e) { continue; } // already loaded, so this is a cache hit
-      for (const value of Object.values(module)) {
-        if (typeof value !== 'function' || !value.prototype) continue;
-        if (SIM_METHODS.every((name) => typeof value.prototype[name] === 'function')) return value;
-      }
-    }
-    return null;
-  }
-
-  function hookSimClass(cls) {
-    const proto = cls.prototype;
-    const saved = [];
-    let last = null;
-    const note = (self) => {
-      if (self === last) return;
-      last = self;
-      if (!sims.some((ref) => ref.deref() === self)) sims.push(new WeakRef(self));
-    };
-    for (const name of Object.getOwnPropertyNames(proto)) {
-      if (name === 'constructor') continue;
-      const d = Object.getOwnPropertyDescriptor(proto, name);
-      if (!d.configurable) continue;
-      if (typeof d.value === 'function') {
-        const original = d.value;
-        Object.defineProperty(proto, name, { ...d, value(...args) { note(this); return original.apply(this, args); } });
-      } else if (d.get) {
-        const original = d.get;
-        Object.defineProperty(proto, name, { ...d, get() { note(this); return original.call(this); } });
-      } else {
-        continue;
-      }
-      saved.push([name, d]);
-    }
-    return () => { for (const [name, d] of saved) Object.defineProperty(proto, name, d); };
-  }
-
-  function knownSim(a) {
-    sims = sims.filter((ref) => ref.deref());
-    for (const ref of sims) {
-      const s = ref.deref();
-      if (s && s.graph && s.graph.area === a) return s;
-    }
-    return null;
-  }
-
-  async function prepareSim() {
-    if (simClass) return true;
-    simClass = await locateSimClass();
-    if (!simClass) return false;
-    unhook = hookSimClass(simClass);
-    return true;
-  }
-
-  /** The simulation of the plan currently shown. */
-  async function sim() {
-    const a = area();
-    if (!(await prepareSim())) throw new Error('simulation class not found: this planner build needs an adapter update');
-    let s = knownSim(a);
-    if (s) return s;
-    // Not used since we hooked in. The UI reads it when the selection changes,
-    // so select one more building for a moment.
-    const selection = a.selectionEntities;
-    const probe = placed(a).map((p) => p.e).find((e) => isBuilding(e) && !selection.isEntitySelected(e));
-    if (probe) selection.add(probe);
-    try {
-      for (let i = 0; i < 40 && !s; i++) {
-        await sleep(25);
-        s = knownSim(a);
-      }
-    } finally {
-      if (probe) selection.deselect(probe);
-    }
-    if (!s) throw new Error('simulation not available: the plan may be empty, or this planner build needs an adapter update');
-    return s;
-  }
-
-  // Hook as soon as the planner announces itself, so the first solve is seen.
-  if (typeof window.__area === 'function') {
-    prepareSim();
-  } else {
-    let current;
-    Object.defineProperty(window, '__area', {
-      configurable: true,
-      get: () => current,
-      set(value) {
-        current = value;
-        prepareSim();
-      },
-    });
   }
 
   // ---- catalog -------------------------------------------------------------
@@ -640,14 +540,13 @@
 
   const api = {
     health() {
-      const globals = Object.fromEntries(REQUIRED_GLOBALS.map((k) => [k, typeof window[k]]));
+      const present = typeof window.__h === 'object' && window.__h !== null;
       return {
         adapter: VERSION,
         url: location.href,
         ready: document.readyState,
-        globals,
-        simClass: !!simClass,
-        ok: REQUIRED_GLOBALS.every((k) => typeof window[k] !== 'undefined'),
+        harness: present ? 'window.__h' : null,
+        ok: present,
       };
     },
 
@@ -667,7 +566,7 @@
         depot: depotSummary(a),
       };
       try {
-        const s = await sim();
+        const s = sim();
         out.sim = {
           tick: s.targetTick, ticks: s.tickCount, ticksPerMinute: TICKS_PER_MINUTE,
           solving: s.solveProgress != null || !!s.solvePending, stale: !!s.stale,
@@ -680,14 +579,15 @@
 
     /** Buildings, belts and pipes, optionally limited to a region {x, y, w, h}. */
     async layout({ region } = {}) {
-      const a = area();
-      const s = await sim().catch(() => null);
+      const a = area(), s = sim();
       const buildings = [], paths = [];
       for (const p of placed(a)) {
         const box = footprint(p);
         if (!inRegion(box, region)) continue;
         if (isBuilding(p.e)) {
-          const recipe = s ? recipeText(s.getBuildingRecipes(p.e) || []) : '';
+          // What it is set to make; if nothing is set, what the simulation has it making.
+          const set = p.e.state.recipes || [];
+          const recipe = recipeText(set.length ? set : s.getBuildingRecipes(p.e) || []);
           buildings.push([p.e.uid, p.e.name, box.x, box.y, box.w, box.h, p.e.rotation, recipe, settingsText(p.e)]);
         } else {
           paths.push([p.e.uid, kindOf(p.e), p.e.cells.length, routeOf(p)]);
@@ -729,7 +629,7 @@
 
     /** Who feeds whom, with the rate per minute on each connection. */
     async graph({ uids } = {}) {
-      const s = await sim();
+      const s = sim();
       const only = uids && new Set(uids);
       // The simulation keys an entity as uid * 2; a bridge's second lane is uid * 2 + 1.
       const uidOfKey = (key) => key >> 1;
@@ -756,7 +656,7 @@
 
     /** Per-building input and output rates, starved ports, stalls and depot totals. */
     async flows({ uids, region } = {}) {
-      const a = area(), s = await sim();
+      const a = area(), s = sim();
       const only = uids && new Set(uids);
       const stalled = new Map(s.stalledAt(s.targetTick).map((x) => [x.building, x.clogged ? 'clogged' : 'idle']));
       const buildings = [];
@@ -790,7 +690,7 @@
 
     /** Items moved in and out of buildings over time, summed per window of ticks. */
     async history({ uids, from = 0, to, window: size = 1200 }) {
-      const a = area(), s = await sim();
+      const a = area(), s = sim();
       const names = itemNames(a);
       const end = Math.min(to ?? s.tickCount, s.tickCount);
       const rows = [];
@@ -884,16 +784,6 @@
     async call(name, args) {
       if (typeof api[name] !== 'function') throw new Error(`adapter has no "${name}"`);
       return api[name](args || {});
-    },
-    dispose() {
-      if (unhook) unhook();
-      const d = Object.getOwnPropertyDescriptor(window, '__area');
-      if (d && d.get) {
-        // Put the planner's handle back as a plain property.
-        const value = window.__area;
-        delete window.__area;
-        if (value !== undefined) window.__area = value;
-      }
     },
   };
 })();
