@@ -138,6 +138,73 @@ check("catalog lists the building types", len(catalog["rows"]) >= 70, f"{len(cat
 recipes = call("get_catalog", {"type": "Moulding Unit"})["recipes"]["rows"]
 made = call("apply_edits", {"ops": [{"op": "add_building", "type": "Moulding Unit", "x": 40, "y": 30, "recipe": "Amethyst Bottle"}]})
 check("a recipe can be set by item name", any("Amethyst Bottle" in (b[7] or "") for b in call("get_layout")["buildings"]["rows"]), f"{len(recipes)} recipes for the type")
+bottle = next(r for r in recipes if r[2] == "1 Amethyst Bottle")
+check("a recipe gives the seconds one run takes", bottle[1:] == ["2 Amethyst Fiber", "1 Amethyst Bottle", 2], str(bottle))
+found = call("get_catalog", {"item": "amethyst bottle"})
+makers = [(r[0], r[5]) for r in found["recipes"]["rows"] if r[1] == bottle[0]]
+check("an item search names the building that makes it", found["items"] == ["Amethyst Bottle"] and makers == [("Moulding Unit", "makes")], f"{found['items']} {makers}")
+check("and the recipes that use it", any(r[5] == "uses" for r in found["recipes"]["rows"]), f"{len(found['recipes']['rows'])} recipes")
+water = call("get_catalog", {"item": "Clean Water"})["other"]["rows"]
+check("an item search names where a raw item comes from", ["Fluid Pump", "Clean Water", "source"] in water, str(water))
+partial = call("get_catalog", {"item": "amethyst fib"})["items"]
+check("part of a name is enough", partial == ["Amethyst Fiber"], str(partial))
+unknown = call("get_catalog", {"item": "no such thing"}, expect_error=True)
+check("an unknown item is refused", "no item is called" in unknown, unknown[:80])
+
+print("8. conduit pairing")
+built = call("apply_edits", {"ops": [
+    {"op": "add_building", "type": "Conduit Outlet", "x": 10, "y": 50},
+    {"op": "add_building", "type": "Conduit Inlet", "x": 20, "y": 50},
+    {"op": "add_building", "type": "Conduit Outlet", "x": 30, "y": 50},
+    {"op": "add_building", "type": "Fluid Supply Unit", "x": 40, "y": 50},
+]})
+source, inlet, far_outlet, sink = (r["result"]["added"][0]["uid"] for r in built["results"])
+call("apply_edits", {"ops": [
+    {"op": "configure", "uid": source, "item": "Clean Water", "infinite": True},
+    {"op": "add_path", "kind": "pipe", "route": "10,51>9,51>9,48>23,48>23,51>22,51"},
+    {"op": "add_path", "kind": "pipe", "route": "30,51>29,51>29,54>43,54>43,51>42,51"},
+]})
+settle()
+by_uid, _ = flows()
+check("nothing reaches the sink while the conduits are unpaired", sink not in by_uid, str(by_uid.get(sink)))
+paired = call("apply_edits", {"ops": [{"op": "pair_conduits", "inlet": inlet, "outlet": far_outlet}]})
+check("the pair is reported", paired["results"][0]["result"] == {"inlet": inlet, "outlet": far_outlet}, json.dumps(paired["results"]))
+settle()
+by_uid, _ = flows()
+check("what enters the inlet comes out of the outlet", by_uid.get(sink, ("", ""))[0] == "Clean Water 120", str(by_uid.get(sink)))
+links = [(r[0], r[3], r[7]) for r in call("get_graph")["rows"] if r[6] == "conduit"]
+check("the graph shows the pair as one link", links == [(inlet, far_outlet, "Clean Water 120")], str(links))
+settings = {b[0]: b[8] for b in call("get_layout")["buildings"]["rows"]}
+check("the layout names each partner", (settings[inlet], settings[far_outlet]) == (f"pair={far_outlet}", f"pair={inlet}"), f"{settings[inlet]} | {settings[far_outlet]}")
+refused = call("apply_edits", {"ops": [{"op": "pair_conduits", "inlet": source, "outlet": far_outlet}]}, expect_error=True)
+check("two outlets cannot pair", "one inlet and one outlet" in refused, refused[:110])
+refused = call("apply_edits", {"ops": [{"op": "configure", "uid": far_outlet, "item": "Clean Water"}]}, expect_error=True)
+check("a paired outlet takes no item of its own", "is paired" in refused, refused[:110])
+call("import_blueprint", {"blueprint": call("export_blueprint")["blueprint"]})
+rows = call("get_layout")["buildings"]["rows"]
+check("the pair survives a blueprint round trip", sum("pair=" in b[8] for b in rows) == 2)
+# An import may hand out new uids, so find the two again by what and where they are.
+inlet = next(b[0] for b in rows if b[1] == "Conduit Inlet")
+sink = next(b[0] for b in rows if b[1] == "Fluid Supply Unit" and (b[2], b[3]) == (40, 50))
+unpaired = call("apply_edits", {"ops": [{"op": "unpair_conduit", "uid": inlet}]})
+check("unpairing frees both conduits", len(unpaired["results"][0]["result"]["unpaired"]) == 2, json.dumps(unpaired["results"]))
+settle()
+by_uid, _ = flows()
+check("and the sink runs dry again", sink not in by_uid, str(by_uid.get(sink)))
+
+print("9. power")
+rows = call("get_layout")["buildings"]["rows"]
+dark = [b[0] for b in rows if "unpowered" in b[8].split()]
+counted = call("status")["plan"]["unpowered"]
+check("status counts the buildings the layout marks unpowered", counted == len(dark) > 0, f"{counted} counted, {len(dark)} marked")
+check("the sink has no power, and conduits need none", sink in dark and not any(b[0] in dark for b in rows if b[1].startswith("Conduit")))
+types = {row[1]: row for row in call("get_catalog")["rows"]}
+power = (types["Fluid Supply Unit"][9], types["Conduit Inlet"][9], types["Electric Pylon"][10])
+check("the catalog gives power use and a pylon's area", power == (10, 0, "12x12"), str(power))
+lit = call("apply_edits", {"ops": [{"op": "add_building", "type": "Electric Pylon", "x": 47, "y": 50}]})
+check("a pylon within reach powers the sink", lit["unpowered"] == len(dark) - 1, f"{len(dark)} -> {lit['unpowered']}")
+rows = call("get_layout")["buildings"]["rows"]
+check("and the layout drops the mark", "unpowered" not in next(b[8] for b in rows if b[0] == sink))
 
 print()
 print("FAILED: " + ", ".join(failures) if failures else "all checks passed")

@@ -213,6 +213,8 @@ struct CatalogArgs {
     /// A building type name or id. Give it to list the recipes of that type; omit to list all types.
     #[serde(rename = "type")]
     building: Option<String>,
+    /// An item name, part of one, or an item id. Give it to list every recipe that makes or uses the item, with the building that runs it. With `type` as well, only that building's recipes are searched.
+    item: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema)]
@@ -272,7 +274,7 @@ enum EditOp {
     /// Change the settings of a building. Only the fields given are changed.
     Configure {
         uid: u32,
-        /// Item name or id the building hands out: for depot unloaders, pumps, conduit outlets and control ports.
+        /// Item name or id the building hands out: for depot unloaders, pumps, unpaired conduit outlets and control ports.
         item: Option<String>,
         /// Which output port `item` applies to, for buildings with several. Defaults to the first.
         port: Option<u32>,
@@ -286,7 +288,19 @@ enum EditOp {
         /// Mode label as the planner shows it, for buildings that have modes.
         mode: Option<String>,
     },
-    /// Change what the plan's depot can supply. Unloaders and outlets deliver nothing from an empty depot.
+    /// Pair a conduit inlet with a conduit outlet: whatever flows into the inlet then comes out of the outlet, with no pipe between them. Either may be a manifold. A conduit has one partner, so pairing it again releases the old one.
+    PairConduits {
+        /// Uid of a Conduit Inlet or Conduit Inlet Manifold.
+        inlet: u32,
+        /// Uid of a Conduit Outlet or Conduit Outlet Manifold.
+        outlet: u32,
+    },
+    /// Release a conduit and its partner from their pairing. Each goes back to trading with the depot.
+    UnpairConduit {
+        /// Uid of either conduit of the pair.
+        uid: u32,
+    },
+    /// Change what the plan's depot can supply. Unloaders and unpaired outlets deliver nothing from an empty depot.
     SetDepot {
         /// True makes every item available without limit.
         unlimited: Option<bool>,
@@ -381,7 +395,7 @@ const STATUS_SCRIPT: &str = r#"(async () => {
 #[tool_router]
 impl Planner {
     #[tool(
-        description = "Report the planner channel, whether the adapter can reach the planner's internals, and a summary of the open plan (size, entity counts, simulation state). Call this first: the other tools only work when `adapter.ok` is true.",
+        description = "Report the planner channel, whether the adapter can reach the planner's internals, and a summary of the open plan (size, entity counts, how many buildings lack power as `unpowered`, simulation state). Call this first: the other tools only work when `adapter.ok` is true.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn status(&self) -> CallToolResult {
@@ -396,7 +410,7 @@ impl Planner {
     }
 
     #[tool(
-        description = "List what is placed in the open plan: buildings (uid, name, position, size, rotation, active recipe) and belts and pipes (uid, kind, length, route as corner cells from source to sink). Positions are planner cells: x grows right, y grows down, and an entity's position is the top-left cell of its footprint.",
+        description = "List what is placed in the open plan: buildings (uid, name, position, size, rotation, active recipe, and settings such as the chosen item or a conduit's partner as `pair=uid`, with `unpowered` on a building that needs power and has none) and belts and pipes (uid, kind, length, route as corner cells from source to sink). Positions are planner cells: x grows right, y grows down, and an entity's position is the top-left cell of its footprint.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_layout(&self, Parameters(args): Parameters<LayoutArgs>) -> CallToolResult {
@@ -412,7 +426,7 @@ impl Planner {
     }
 
     #[tool(
-        description = "List the connections of the open plan: which building output port feeds which building input port, through which belts or pipes (`via` uids, empty when the two buildings touch), and the items per minute flowing there.",
+        description = "List the connections of the open plan: which building output port feeds which building input port, through which belts or pipes (`via` uids, empty when the two buildings touch, `conduit` for a paired conduit inlet and outlet), and the items per minute flowing there.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_graph(&self, Parameters(args): Parameters<GraphArgs>) -> CallToolResult {
@@ -436,7 +450,7 @@ impl Planner {
     }
 
     #[tool(
-        description = "List the building and path types that can be placed (id, name, layer, size, port counts), or with `type` the recipes of one building type.",
+        description = "List the building and path types that can be placed (id, name, layer, size, port counts, the power each uses, and the area a pylon or relay powers). With `type`, list the recipes of one building type: inputs, outputs and the seconds one run takes. With `item`, search the recipes by item name: every recipe that makes or uses the item and the building that runs it, plus the buildings that supply or consume it without a recipe (mining rigs, pumps and the like). A recipe that takes `seconds` runs at most 60 / seconds times a minute.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn get_catalog(&self, Parameters(args): Parameters<CatalogArgs>) -> CallToolResult {
@@ -444,7 +458,7 @@ impl Planner {
     }
 
     #[tool(
-        description = "Change the open plan: add buildings, belts and pipes, delete, move, rotate, set recipes, change building settings (item, rate limit, count) and the depot. The edits are applied in order as one batch: if any of them fails (for example the target cells are occupied) none is applied. Where a new belt or pipe crosses an existing one the planner splits both and adds a bridge, which the result reports. The batch is one undo step in the planner, and the previous state of the plan is saved as a snapshot first. The planner applies its own placement rules. Afterwards check the result with `get_graph` and `get_flows`: the simulation needs a moment to re-solve, shown as `solving`. Fails on a read-only plan.",
+        description = "Change the open plan: add buildings, belts and pipes, delete, move, rotate, set recipes, change building settings (item, rate limit, count), pair conduits and set the depot. The edits are applied in order as one batch: if any of them fails (for example the target cells are occupied) none is applied. Where a new belt or pipe crosses an existing one the planner splits both and adds a bridge, which the result reports. The batch is one undo step in the planner, and the previous state of the plan is saved as a snapshot first. The planner applies its own placement rules. Afterwards check the result with `get_graph` and `get_flows`: the simulation needs a moment to re-solve, shown as `solving`. The simulation runs buildings without power, so also check `unpowered` in the result: it counts the buildings that need power and have none. Fails on a read-only plan.",
         annotations(read_only_hint = false, destructive_hint = false, open_world_hint = false)
     )]
     async fn apply_edits(&self, Parameters(args): Parameters<EditArgs>) -> CallToolResult {
@@ -626,7 +640,7 @@ impl Planner {
 #[tool_handler(
     router = self.router,
     name = "enkad-mcp",
-    instructions = "Reads and edits the EnKA AIC planner (the Arknights: Endfield factory planner) shown in the EnkaD MCP window. Call `status` first. Read with `get_layout`, `get_graph` and `get_flows`; change with `apply_edits`, then read again to confirm the result. Every change is saved as a snapshot first and can be undone with `snapshot_restore`. All tools act on the plan that is open in the window. Entities are identified by `uid`, which is stable while a plan stays open."
+    instructions = "Reads and edits the EnKA AIC planner (the Arknights: Endfield factory planner) shown in the EnkaD MCP window. Call `status` first. Read with `get_layout`, `get_graph` and `get_flows`; change with `apply_edits`, then read again to confirm the result. Every change is saved as a snapshot first and can be undone with `snapshot_restore`. The planner needs no power supply: its simulation runs every building whether or not it has power, so flows alone do not show a plan that would stand still in the game. Always verify that every building that uses power is powered: `status` and `apply_edits` count those that are not as `unpowered`, and `get_layout` marks each one. A building is powered when one of its cells lies in the area of a pylon or relay; some buildings, such as conduits, use no power. All tools act on the plan that is open in the window. Entities are identified by `uid`, which is stable while a plan stays open."
 )]
 impl ServerHandler for Planner {}
 

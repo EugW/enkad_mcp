@@ -5,10 +5,9 @@
 // Coordinates are the planner's own placement cells: x grows right, y grows down,
 // and an entity's position is the top-left cell of its footprint.
 (() => {
-  const VERSION = 3;
+  const VERSION = 5;
 
   const TICKS_PER_MINUTE = 240;
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const round = (n, digits = 3) => Math.round(n * 10 ** digits) / 10 ** digits;
 
   // ---- planner handles -----------------------------------------------------
@@ -204,8 +203,23 @@
     throw new Error(`this port cannot output "${wanted}"${close.length ? `; did you mean ${close.join(', ')}?` : ''}`);
   }
 
-  /** "item=Clean Water rate=6/m count=5 infinite", or "" when everything is at its default. */
-  function settingsText(e) {
+  // A conduit inlet and outlet that share a channel number are a pair: whatever
+  // flows into the inlet comes out of the outlet. Unpaired, each trades with the depot.
+  const isConduit = (e) => isBuilding(e) && !!e.connectable;
+  const isInlet = (e) => e.ports.some((p) => !p.output);
+
+  // The simulation runs a building whether or not it has power; the game does not.
+  // The planner flags each building as powered or not when its power map is read:
+  // one that uses power is powered when a cell of it lies in the area of a pylon or relay.
+  function lacksPower(a, e) {
+    void a.power; // brings the flags up to date
+    return isBuilding(e) && e.powerConsume > 0 && !e.powered;
+  }
+
+  const unpoweredCount = (a) => placed(a).filter(({ e }) => lacksPower(a, e)).length;
+
+  /** "item=Clean Water rate=6/m count=5 infinite pair=12 unpowered", or "" when there is nothing to say. */
+  function settingsText(a, e) {
     const parts = [];
     const ports = itemPorts(e);
     for (const p of ports) {
@@ -219,6 +233,9 @@
     if (e.state.disabled) parts.push('disabled');
     const mode = (e.modes || []).find((m) => m.value === e.state.mode);
     if (mode && e.state.mode) parts.push(`mode=${mode.label}`);
+    const partner = isConduit(e) && a.conduitPartner(e);
+    if (partner) parts.push(`pair=${partner.uid}`);
+    if (lacksPower(a, e)) parts.push('unpowered');
     return parts.join(' ');
   }
 
@@ -241,6 +258,60 @@
     if (hit) return hit;
     const close = items.filter((i) => i.name.toLowerCase().includes(text)).slice(0, 8).map((i) => i.name);
     throw new Error(`unknown item "${wanted}"${close.length ? `; did you mean ${close.join(', ')}?` : ''}`);
+  }
+
+  /** Items called `wanted`, or failing that the ones whose name contains it, up to `most` of them. */
+  function searchItems(a, wanted, most) {
+    const text = String(wanted).trim().toLowerCase();
+    const items = allItems(a);
+    const exact = items.filter((i) => String(i.numericId) === text || i.name.toLowerCase() === text);
+    if (exact.length) return exact;
+    const close = text ? items.filter((i) => i.name.toLowerCase().includes(text)) : [];
+    if (!close.length) throw new Error(`no item is called "${wanted}"`);
+    if (close.length > most) {
+      const shown = close.slice(0, MAX_ITEM_MATCHES).map((i) => i.name).join(', ');
+      throw new Error(`"${wanted}" matches ${close.length} items; give more of the name: ${shown}, ...`);
+    }
+    return close;
+  }
+  const MAX_ITEM_MATCHES = 12;
+
+  /** How long one run of a recipe takes, worked out as the planner's own display does. */
+  const recipeSeconds = (r) => round(r.data.totalProgress / 60 / 100, 2);
+  const recipeRow = (r) => [r.numericId, partsText(r.ingredients), partsText(r.outcomes), recipeSeconds(r)];
+
+  /** Outputs whose item is picked from a list rather than made: mining rigs, pumps, extractors. */
+  const sourcePorts = (e) => e.ports.filter((p) => p.output && p.virtual && p.settableOutput && !p.depotAccess);
+
+  /** Every recipe that makes or uses an item, and the buildings that deal with it without a recipe. */
+  function itemUses(a, wanted, type) {
+    // A loose name is fine within one building; across all of them it would return most of the game.
+    const items = searchItems(a, wanted, type == null ? MAX_ITEM_MATCHES : Infinity);
+    const ids = new Set(items.map((i) => i.numericId));
+    const names = new Map(items.map((i) => [i.numericId, i.name]));
+    const has = (parts) => parts.some((p) => p.item && ids.has(p.item.numericId));
+    const types = type == null ? catalog(a) : [findType(a, type)];
+    const recipes = [], other = [];
+    for (const t of types.filter((t) => t.kind === 'building')) {
+      const e = t.sample;
+      for (const r of e.recipes || []) {
+        const role = [has(r.outcomes) && 'makes', has(r.ingredients) && 'uses'].filter(Boolean).join(', ');
+        if (role) recipes.push([t.name, ...recipeRow(r), role]);
+      }
+      const listed = (list, role) => {
+        for (const id of new Set(list)) if (ids.has(id)) other.push([t.name, names.get(id), role]);
+      };
+      listed(sourcePorts(e).flatMap((p) => p.items || []).map((i) => i.numericId), 'source');
+      listed(((e.fluidConsume || {}).items || []).map((i) => i.numericId), 'consumes');
+      listed((e.fuelSlots || []).map((slot) => slot.itemId), 'fuel');
+    }
+    recipes.sort((x, y) => y[5].startsWith('makes') - x[5].startsWith('makes'));
+    return {
+      items: items.map((i) => i.name),
+      recipes: { columns: ['building', 'recipeId', 'inputs', 'outputs', 'seconds', 'role'], rows: recipes },
+      other: { columns: ['building', 'item', 'role'], rows: other },
+      note: 'seconds is the time one run of a recipe takes; other lists buildings that deal with the item without a recipe: a source hands it out once `configure` sets it as the item, a consumer takes it in, fuel is burned for power',
+    };
   }
 
   /** What the plan's depot can hand out. Unloaders and outlets draw from it. */
@@ -268,6 +339,12 @@
   function select(a, uids) {
     a.selectionEntities.clear();
     for (const uid of uids) a.selectionEntities.add(entity(a, uid));
+  }
+
+  function conduit(a, uid) {
+    const e = entity(a, uid);
+    if (!isConduit(e)) throw new Error(`uid ${uid} (${e.name}) is not a conduit`);
+    return e;
   }
 
   const describeAt = (p) => {
@@ -417,6 +494,9 @@
       if (!isBuilding(e)) throw new Error(`uid ${op.uid} is not a building`);
       if (op.item !== undefined) {
         const port = itemPort(e, op.port);
+        if (!port && isConduit(e) && a.conduitPartner(e)) {
+          throw new Error(`${e.name} uid ${e.uid} is paired and hands out what its inlet takes in: unpair it to choose an item`);
+        }
         if (!port) throw new Error(`${e.name} has no output whose item can be chosen`);
         port.state.outputItem = op.item === null ? null : findItem(port, op.item);
       }
@@ -440,7 +520,30 @@
         if (!mode) throw new Error(`${e.name} has no mode "${op.mode}"${modes.length ? `; it has ${modes.map((m) => m.label).join(', ')}` : ''}`);
         e.state.mode = mode.value;
       }
-      return { uid: e.uid, name: e.name, settings: settingsText(e) };
+      return { uid: e.uid, name: e.name, settings: settingsText(a, e) };
+    },
+
+    pair_conduits(a, op) {
+      const first = conduit(a, op.inlet), second = conduit(a, op.outlet);
+      if (!a.conduitsCompatible(first, second)) {
+        throw new Error(`cannot pair ${first.name} uid ${first.uid} with ${second.name} uid ${second.uid}: a pair is one inlet and one outlet`);
+      }
+      const [inlet, outlet] = isInlet(first) ? [first, second] : [second, first];
+      // A conduit has one partner, so the planner lets go of any they had before.
+      const released = [inlet, outlet].map((e) => a.conduitPartner(e))
+        .filter((e) => e && e !== inlet && e !== outlet).map((e) => e.uid);
+      if (a.conduitPartner(inlet) !== outlet) a.connectConduits(inlet, outlet);
+      if (a.conduitPartner(inlet) !== outlet) throw new Error('the planner did not pair them');
+      const result = { inlet: inlet.uid, outlet: outlet.uid };
+      if (released.length) result.unpaired = released;
+      return result;
+    },
+
+    unpair_conduit(a, op) {
+      const e = conduit(a, op.uid);
+      const partner = a.conduitPartner(e);
+      a.disconnectConduit(e);
+      return { unpaired: partner ? [e.uid, partner.uid] : [] };
     },
 
     set_depot(a, op) {
@@ -499,7 +602,7 @@
     a.serializeGuard = false;
     await nextSerialise(a);
     stack.past.splice(depth, Math.max(0, stack.past.length - depth - 1));
-    return { applied: results.length, results, counts: counts(a), undoDepth: stack.past.length };
+    return { applied: results.length, results, counts: counts(a), unpowered: unpoweredCount(a), undoDepth: stack.past.length };
   }
 
   /**
@@ -560,6 +663,7 @@
           buildable: buildable(a),
           contentBounds: { x: bounds.x, y: bounds.y, w: bounds.w, h: bounds.h },
           counts: counts(a),
+          unpowered: unpoweredCount(a),
           readOnly: !!a.readOnly(),
           undoDepth: a.undoStack.past.length,
         },
@@ -588,7 +692,7 @@
           // What it is set to make; if nothing is set, what the simulation has it making.
           const set = p.e.state.recipes || [];
           const recipe = recipeText(set.length ? set : s.getBuildingRecipes(p.e) || []);
-          buildings.push([p.e.uid, p.e.name, box.x, box.y, box.w, box.h, p.e.rotation, recipe, settingsText(p.e)]);
+          buildings.push([p.e.uid, p.e.name, box.x, box.y, box.w, box.h, p.e.rotation, recipe, settingsText(a, p.e)]);
         } else {
           paths.push([p.e.uid, kindOf(p.e), p.e.cells.length, routeOf(p)]);
         }
@@ -636,21 +740,28 @@
       const rows = [];
       for (const [from, edges] of s.graph.outgoing) {
         const out = s.buildingEdgeRates(from).filter((r) => r.dir === 1);
+        let pairShown = false;
         for (const edge of edges) {
           const to = edge.bPort.parent;
           if (only && !only.has(from.uid) && !only.has(to.uid)) continue;
-          const via = edge.entities.map((e) => e.uid);
+          // The simulation joins a paired inlet's inputs to its outlet's outputs port
+          // by port, but shares the flow among them all: report the pair as one link.
+          const paired = !edge.aPort.output && isConduit(from) && isConduit(to);
+          if (paired && pairShown) continue;
+          pairShown ||= paired;
+          const via = paired ? ['conduit'] : edge.entities.map((e) => e.uid);
           // Two belts between the same pair share a peer, so prefer the belt's own rate.
           const rates = edge.entities.length
             ? rateList(s.pathRates(edge.entities[0]), 1)
             : rateList(out.filter((r) => uidOfKey(r.peer) === to.uid), TICKS_PER_MINUTE);
-          rows.push([from.uid, from.name, edge.aPort.index, to.uid, to.name, edge.bPort.index, via.join(' '), rates]);
+          const [outPort, inPort] = paired ? [null, null] : [edge.aPort.index, edge.bPort.index];
+          rows.push([from.uid, from.name, outPort, to.uid, to.name, inPort, via.join(' '), rates]);
         }
       }
       return {
         columns: ['from', 'fromName', 'outPort', 'to', 'toName', 'inPort', 'via', 'perMinute'],
         rows,
-        note: '"~" after a rate means it has not settled',
+        note: '"~" after a rate means it has not settled; via "conduit" is a paired inlet and outlet, which share the flow among all their ports',
       };
     },
 
@@ -717,31 +828,35 @@
       };
     },
 
-    /** Building and path types that can be placed, or one type's recipes. */
-    catalog({ type } = {}) {
+    /** Building and path types that can be placed, one type's recipes, or the recipes for an item. */
+    catalog({ type, item } = {}) {
       const a = area();
+      if (item != null) return itemUses(a, item, type);
       if (type != null) {
         const t = findType(a, type);
         return {
           id: t.id, name: t.name,
           recipes: {
-            columns: ['recipeId', 'inputs', 'outputs'],
-            rows: (t.sample.recipes || []).map((r) => [r.numericId, partsText(r.ingredients), partsText(r.outcomes)]),
+            columns: ['recipeId', 'inputs', 'outputs', 'seconds'],
+            rows: (t.sample.recipes || []).map(recipeRow),
           },
         };
       }
       return {
-        columns: ['id', 'name', 'kind', 'layer', 'w', 'h', 'inputs', 'outputs', 'recipes'],
+        columns: ['id', 'name', 'kind', 'layer', 'w', 'h', 'inputs', 'outputs', 'recipes', 'powerUse', 'powerArea'],
         rows: catalog(a).map((t) => {
           const e = t.sample, building = t.kind === 'building';
           const ports = building ? e.ports : [];
+          const area = building && e.power;
           return [
             t.id, t.name, t.kind, (e.layerTag & a.pipeLayer.tags) ? 'pipe' : 'ground',
             building ? e.currentSize.w : 1, building ? e.currentSize.h : 1,
             ports.filter((p) => !p.output).length, ports.filter((p) => p.output).length,
             building ? (e.recipes || []).length : 0,
+            (building && e.powerConsume) || 0, area ? `${area.w}x${area.h}` : '',
           ];
         }),
+        note: 'powerUse is the power a building needs; powerArea is the rectangle of cells, centred on a pylon or relay, that it powers',
       };
     },
 
@@ -763,17 +878,17 @@
     async importBlueprint({ blueprint }) {
       const a = area();
       if (a.readOnly()) throw new Error('the open plan is read-only: press Edit in the planner to work on a copy');
-      const stack = a.undoStack;
-      const depth = stack.past.length;
       a.mode = PLANNER_MODE_DEFAULT;
       a.selectionEntities.clear();
+      // deserialize would record the string itself as an undo step; the guard stops
+      // that. The planner then re-serialises the plan it loaded, which is the one
+      // step to keep, and re-serialises nothing when it could not read the string.
+      // Counting undo steps would not show this: the planner keeps only the last 20.
+      a.serializeGuard = true;
       a.deserialize(blueprint);
-      // deserialize records the string as an undo step, and the planner then
-      // re-serialises the loaded plan and records that too. Keep only the second.
-      if (stack.past.length > depth) stack.past.pop();
-      for (let i = 0; i < 80 && stack.past.length <= depth; i++) await sleep(25);
-      if (stack.past.length <= depth) throw new Error('not a readable blueprint string; the plan was left unchanged');
-      return { plan: planName(), width: a.safeW, height: a.safeH, counts: counts(a), undoDepth: stack.past.length };
+      a.serializeGuard = false;
+      if (!await nextSerialise(a, 2000)) throw new Error('not a readable blueprint string; the plan was left unchanged');
+      return { plan: planName(), width: a.safeW, height: a.safeH, counts: counts(a), undoDepth: a.undoStack.past.length };
     },
   };
 
